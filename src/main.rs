@@ -17,14 +17,16 @@ use bevy::sprite::SpriteSystem;
 use bevy::utils::HashSet;
 use bevy::window::WindowResolution;
 use bimap::BiMap;
+use rand::distributions::Uniform;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rand::Rng;
 use std::f32::consts::FRAC_PI_2;
 use std::f32::consts::PI;
+use std::f32::consts::TAU;
 
 const BUG_SPRITE_PATHS: [&str; 3] = [
-    "sprites/bug-a.png",
+    "sprites/bug-d.png",
     "sprites/bug-b.png",
     "sprites/bug-c.png",
 ];
@@ -213,6 +215,7 @@ struct ActivePill;
 
 #[derive(Component, Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 enum GameSet {
+    Animation,
     Input,
     RotatePill,
     DropPill,
@@ -322,7 +325,22 @@ fn main() {
         PreUpdate,
         (update_pill_timers.before(GameSet::SpawnPill),).run_if(in_state(GameState::PillFalling)),
     )
+    .add_state::<AppState>()
     .add_state::<GameState>()
+    .add_event::<SpawnExplosionMessage>()
+    .add_systems(Update, 
+        (
+            spawn_explosions.after(GameSet::Jar),
+            velocity_physics,
+            fade_out,
+            update_flippers.in_set(GameSet::Animation),
+        ).run_if(in_state(AppState::Game)),
+    )
+    .add_systems(PreUpdate,
+        (
+            update_despawn_timers,
+        ).run_if(in_state(AppState::Game)),
+    )
     .add_systems(
         Update,
         (
@@ -358,7 +376,11 @@ fn main() {
     if let Ok(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
         render_app.add_systems(
             ExtractSchedule,
-            (extract_organ_sprites.after(SpriteSystem::ExtractSprites),),
+            (   
+                        extract_organ_sprites,
+                        extract_wall_sprites,
+                )
+                .after(SpriteSystem::ExtractSprites)
         );
     }
 
@@ -436,8 +458,8 @@ fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
                 });
 
             parent
-                .spawn(NodeBundle {
-                    style: Style {
+            .spawn(NodeBundle {
+            style: Style {
                         size: Size::new(Val::Px(160.), Val::Px(80.)),
                         margin: UiRect::all(Val::Px(20.)),
                         flex_direction: FlexDirection::Column,
@@ -478,8 +500,25 @@ fn spawn_organ(
                 ..TileBundle::random(rng, back_textures, pos, Depth::OrganBack)
             });
         } else if pos.y < inner.max_y() {
+            let wx = 
+                if pos.x == outer.pos.x {
+                    -1.
+                } else if pos.x == inner.max_x() {
+                    1.
+                } else {
+                    0.
+                };
+            let wy =
+                if pos.y == outer.pos.y {
+                    -1.
+                } else { 
+                    0. 
+                };
+            let w = 8. * vec2(wx, wy);
+                         
             commands
-                .spawn(TileBundle::random(rng, wall_textures, pos, Depth::OrganWall).add_shadow());
+                .spawn((TileBundle::random(rng, wall_textures, pos, Depth::OrganWall).add_shadow(), WallEffect(w)));
+            
         } else {
             continue;
         };
@@ -522,8 +561,10 @@ fn spawn_germs(commands: &mut Commands, count: usize, jar: &mut Jar, asset_serve
                     )
                     .depth(Depth::Bug),
                     Bug,
+                    Flip::default(),
+                    Flipper { remaining: 0.35, total: 0.35 },
                 )
-                    .add_shadow(),
+                .add_shadow(),
             )
             .id();
         jar.insert(cell, bug_id);
@@ -824,6 +865,7 @@ fn swap_pill_ends(
 struct PillCommands {
     dir: Option<Dir>,
     x_move: i16,
+    immediate_move: bool,
     drop: bool,
 }
 
@@ -843,11 +885,18 @@ fn handle_input(keyboard: Res<Input<KeyCode>>, mut pill_command: ResMut<PillComm
         }
     }
 
-    if keyboard.pressed(KeyCode::Left) {
+    pill_command.immediate_move = false;
+    if keyboard.pressed(KeyCode::Left) {        
         pill_command.x_move -= 1;
+        if keyboard.just_pressed(KeyCode::Left) {
+            pill_command.immediate_move = true;
+        }
     }
     if keyboard.pressed(KeyCode::Right) {
         pill_command.x_move += 1;
+        if keyboard.just_pressed(KeyCode::Right) {
+            pill_command.immediate_move = true;
+        }
     }
 
     pill_command.drop = false;
@@ -869,16 +918,18 @@ fn move_pill(
     let (mut pivot_pos, mut delay) = pivot_pill_query.single_mut();
     let mut end_pos = end_pill_query.single_mut();
 
-    if delay.0 < 0. && pill_commands.x_move != 0 {
-        let new_pivot_pos = pivot_pos.translate(pill_commands.x_move, 0);
-        let new_end_pos = end_pos.translate(pill_commands.x_move, 0);
-        if [new_pivot_pos, new_end_pos]
-            .iter()
-            .all(|&pos| jar.is_empty(pos))
-        {
-            *pivot_pos = new_pivot_pos;
-            *end_pos = new_end_pos;
-            delay.0 = game_config.horizontal_move_delay;
+    if pill_commands.x_move != 0 {
+        if delay.0 < 0. || pill_commands.immediate_move == true {
+            let new_pivot_pos = pivot_pos.translate(pill_commands.x_move, 0);
+            let new_end_pos = end_pos.translate(pill_commands.x_move, 0);
+            if [new_pivot_pos, new_end_pos]
+                .iter()
+                .all(|&pos| jar.is_empty(pos))
+            {
+                *pivot_pos = new_pivot_pos;
+                *end_pos = new_end_pos;
+                delay.0 = game_config.horizontal_move_delay;
+            }
         }
     }
 }
@@ -966,6 +1017,7 @@ fn search_jar_for_flavour_lines(
     mut next_state: ResMut<NextState<GameState>>,
     mut joined_query: Query<&Joined>,
     mut image_query: Query<&mut Handle<Image>>,
+    mut spawn_explosion: EventWriter<SpawnExplosionMessage>,
 ) {
     let matches = find_flavour_lines(
         |pos| {
@@ -986,6 +1038,8 @@ fn search_jar_for_flavour_lines(
                     commands.entity(join.0).remove::<Joined>();
                 }
             }
+            let color = pill_bugs_query.get(entity).unwrap().color();
+            spawn_explosion.send(SpawnExplosionMessage { pos, color });
             commands.entity(entity).despawn();
             removed.insert(entity);
         }
@@ -1138,25 +1192,31 @@ impl Default for ShadowOffset {
         Self(SHADOW_OFFSET)
     }
 }
+const SHADOW_ALPHA: f32 = 0.5;
 
 fn extract_organ_sprites(
     mut extracted_sprites: ResMut<ExtractedSprites>,
     organ_geometry: Extract<Res<OrganGeometry>>,
     shadow_offset: Extract<Res<ShadowOffset>>,
     sprite_query: Extract<
-        Query<(
-            Entity,
-            &ComputedVisibility,
-            &Pos,
-            &Handle<Image>,
-            &Dir,
-            &Tint,
-            &Depth,
-            Option<&Flip>,
-            Option<&Shadow>,
-        )>,
+        Query<
+         (
+                Entity,
+                &ComputedVisibility,
+                &Pos,
+                &Handle<Image>,
+                &Dir,
+                &Tint,
+                &Depth,
+                Option<&Flip>,
+                Option<&Shadow>,
+            ), 
+            Without<WallEffect>
+        >
     >,
+    time: Extract<Res<Time>>,
 ) {
+    let s = (1.0 + time.elapsed_seconds().sin()) / 2.;
     for (entity, vis, pos, image, orientation, &Tint(color), depth, flip, shadow) in
         sprite_query.iter()
     {
@@ -1166,19 +1226,21 @@ fn extract_organ_sprites(
 
         let flip = flip.copied().unwrap_or_default();
         let translation = organ_geometry.map_pos(*pos);
-
+        let size = organ_geometry.cell_size;
+        let m = Mat3A::from_rotation_z(orientation.angle());
+       
         if shadow.is_some() {
             extracted_sprites.sprites.push(ExtractedSprite {
                 entity,
-                color: Color::BLACK.with_a(0.5),
+                color: Color::BLACK.with_a(SHADOW_ALPHA),
                 transform: Affine3A {
-                    matrix3: Mat3A::from_rotation_z(orientation.angle()),
+                    matrix3: m,
                     translation: (translation + shadow_offset.0 + Depth::Shadow.z() * Vec3::Z)
                         .into(),
                 }
                 .into(),
                 rect: None,
-                custom_size: Some(organ_geometry.cell_size),
+                custom_size: Some(size),
                 flip_x: flip.x,
                 flip_y: flip.y,
                 image_handle_id: image.id(),
@@ -1190,12 +1252,83 @@ fn extract_organ_sprites(
             entity,
             color,
             transform: Affine3A {
-                matrix3: Mat3A::from_rotation_z(orientation.angle()),
+                matrix3: m,
                 translation: (translation + depth.z() * Vec3::Z).into(),
             }
             .into(),
             rect: None,
-            custom_size: Some(organ_geometry.cell_size),
+            custom_size: Some(size),
+            flip_x: flip.x,
+            flip_y: flip.y,
+            image_handle_id: image.id(),
+            anchor: Vec2::ZERO,
+        });
+    }
+}
+
+
+fn extract_wall_sprites(
+    mut extracted_sprites: ResMut<ExtractedSprites>,
+    organ_geometry: Extract<Res<OrganGeometry>>,
+    shadow_offset: Extract<Res<ShadowOffset>>,
+    sprite_query: Extract<
+        Query<(
+            Entity,
+            &ComputedVisibility,
+            &Pos,
+            &Handle<Image>,
+            &Tint,
+            &Depth,
+            Option<&Flip>,
+            Option<&Shadow>,
+            &WallEffect,
+        )>
+    >,
+    time: Extract<Res<Time>>,
+) {
+    let p = 1.25;
+    let a = 1.;
+    let s = a * (1.0 + (time.elapsed_seconds() / p).cos()) / 2.;
+
+    for (entity, vis, pos, image, &Tint(color), depth, flip, shadow, wall_effect) in
+        sprite_query.iter()
+    {
+        if !vis.is_visible() {
+            continue;
+        };
+
+        let flip = flip.copied().unwrap_or_default();
+        let size = organ_geometry.cell_size + wall_effect.0.abs() * s;
+        let translation = organ_geometry.map_pos(*pos) +  (0.5 * wall_effect.0 * s).extend(0.);
+        if shadow.is_some() {
+            extracted_sprites.sprites.push(ExtractedSprite {
+                entity,
+                color: Color::BLACK.with_a(SHADOW_ALPHA),
+                transform: Affine3A {
+                    translation: (translation + shadow_offset.0 + Depth::Shadow.z() * Vec3::Z)
+                        .into(),
+                    ..Default::default()
+                }
+                .into(),
+                rect: None,
+                custom_size: Some(size),
+                flip_x: flip.x,
+                flip_y: flip.y,
+                image_handle_id: image.id(),
+                anchor: Vec2::ZERO,
+            });
+        }
+
+        extracted_sprites.sprites.push(ExtractedSprite {
+            entity,
+            color,
+            transform: Affine3A {
+                translation: (translation + depth.z() * Vec3::Z).into(),
+                ..Default::default()
+            }
+            .into(),
+            rect: None,
+            custom_size: Some(size),
             flip_x: flip.x,
             flip_y: flip.y,
             image_handle_id: image.id(),
@@ -1215,7 +1348,7 @@ fn wait_system(
     mut next: ResMut<NextStateTimer<GameState>>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
-    next.remaining -= time.elapsed_seconds();
+    next.remaining -= time.delta_seconds();
     if next.remaining < 0. {
         next_state.set(next.next);
     }
@@ -1260,7 +1393,7 @@ fn collapse_pills(
 
     if drop {
         commands.insert_resource(NextStateTimer {
-            remaining: 0.4,
+            remaining: 0.25,
             next: GameState::Collapsing,
         });
     } else {
@@ -1272,10 +1405,42 @@ fn collapse_pills(
     next_state.set(GameState::Wait);
 }
 
+
 struct SpawnExplosionMessage {
     pos: Pos,
     color: Color,
 }
+
+#[derive(Component)]
+#[derive(Clone, Copy)]
+struct Velocity(Vec2);
+
+fn velocity_physics(
+    time: Res<Time>,
+    mut query: Query<(&Velocity, &mut Transform)>,
+) {
+    for (v, mut tf) in query.iter_mut() {
+        let v = v.0 * time.delta_seconds();
+        tf.translation.x += v.x;
+        tf.translation.y += v.y;
+    }
+}
+
+#[derive(Component)]
+#[derive(Clone, Copy)]
+struct FadeOut(f32);
+
+fn fade_out(
+    time: Res<Time>,
+    mut query: Query<(&mut Sprite, &FadeOut)>,
+) {
+    for (mut s, f) in query.iter_mut() {
+        if let Some(ref mut c) = s.custom_size {
+            *c *= 1. - f.0 * time.delta_seconds();
+        }
+    }
+}
+
 
 fn spawn_explosions(
     mut explosion_events: EventReader<SpawnExplosionMessage>,
@@ -1283,6 +1448,77 @@ fn spawn_explosions(
     organ_geometry: Res<OrganGeometry>,
 ) {
     let rng = &mut thread_rng();
+    let o = organ_geometry.cell_size.x;
+    let range_distribution = Uniform::new(0., 0.35 * o);
+    let angle_distribution = Uniform::new(0., TAU);
+    let speed_distribution = Uniform::new(0.5 * o , 0.9 * o);
+    
+    for e in explosion_events.iter() {
+        commands.spawn((SpatialBundle {
+            transform: Transform::from_translation(organ_geometry.map_pos(e.pos)),
+            ..Default::default()
+        }, 
+        DespawnTimer(0.66),
+    )
+
+    ).with_children(|parent| {
+            for _ in 0..20 {
+                let s: f32 = *[2., 3., 4.].choose(rng).unwrap();
+                let displacement = rng.sample(range_distribution);
+                let dir = rng.sample(angle_distribution);
+                let speed = rng.sample(speed_distribution);
+                let q = Quat::from_rotation_z(dir);
+                parent.spawn(SpatialBundle {
+                    transform: Transform::from_rotation(q),
+                    ..Default::default()
+                }).with_children(|parent| {
+                    parent.spawn((
+                        SpriteBundle {
+                            sprite: Sprite {
+                                color: e.color,
+                                custom_size: Some(Vec2::splat(s)),
+                                ..Default::default()
+                            },
+                            transform: Transform {
+                                translation: displacement * Vec3::Y + Depth::Top.z() * Vec3::Z,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        Velocity(speed * Vec2::Y),
+                        FadeOut(1.75),
+                    ));
+                });
+
+                parent.spawn(SpatialBundle {
+                    transform: Transform {
+                        translation: SHADOW_OFFSET,
+                        rotation: q,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }).with_children(|parent| {
+                    parent.spawn((
+                        SpriteBundle {
+                            sprite: Sprite {
+                                color: Color::BLACK.with_a(SHADOW_ALPHA),
+                                custom_size: Some(Vec2::splat(s)),
+                                ..Default::default()
+                            },
+                            transform: Transform {
+                                translation: displacement * Vec3::Y + Depth::Shadow.z() * Vec3::Z,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        Velocity(speed * Vec2::Y),
+                        FadeOut(1.75),
+                    ));
+                });
+                
+            }
+        });
+    }
 }
 
 #[derive(Component)]
@@ -1294,3 +1530,42 @@ struct JarManager<'w, 's> {
     pill_query: Query<'w, 's, &'static PillPart>,
     pos_query: Query<'w, 's, &'static mut Pos>,
 }
+
+#[derive(Component)]
+struct DespawnTimer(f32);
+
+fn update_despawn_timers(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut query: Query<(Entity, &mut DespawnTimer)>,
+) {
+    query.for_each_mut(|(e, mut dt)| {
+        dt.0 -= time.delta_seconds();
+        if dt.0 < 0. {
+            commands.entity(e).despawn_recursive();
+        }
+    });
+
+}
+
+#[derive(Component)]
+struct Flipper {
+    remaining: f32,
+    total: f32,
+}
+
+fn update_flippers(
+    time: Res<Time>,
+    mut flip_query: Query<(&mut Flip, &mut Flipper)>
+) {
+    flip_query.for_each_mut(|(mut flip, mut flipper)| {
+        flipper.remaining -= time.delta_seconds();
+        if flipper.remaining < 0. {
+            flipper.remaining = flipper.total;
+            flip.x = !flip.x;
+        }
+    });
+}
+
+#[derive(Component)]
+struct WallEffect(Vec2);
