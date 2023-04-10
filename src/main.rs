@@ -1,5 +1,7 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::too_many_arguments)]
+mod title_screen;
+mod input;
 
 use bevy::core_pipeline::clear_color::ClearColorConfig;
 use bevy::ecs::system::SystemParam;
@@ -9,6 +11,7 @@ use bevy::math::Affine3A;
 use bevy::math::Mat3A;
 use bevy::prelude::*;
 use bevy::reflect::TypeUuid;
+use bevy::render::camera;
 use bevy::render::texture::DEFAULT_IMAGE_HANDLE;
 use bevy::render::Extract;
 use bevy::sprite::ExtractedSprite;
@@ -24,7 +27,7 @@ use rand::Rng;
 use std::f32::consts::FRAC_PI_2;
 use std::f32::consts::PI;
 use std::f32::consts::TAU;
-
+use std::marker::PhantomData;
 const BUG_SPRITE_PATHS: [&str; 3] = [
     "sprites/bug-d.png",
     "sprites/bug-b.png",
@@ -34,11 +37,9 @@ const PILL_SPRITE_PATH: &str = "sprites/pill.png";
 const PILL_BROKE_SPRITE_PATH: &str = "sprites/pill-broke.png";
 const FONT_PATH: &str = "fonts/slkscre.ttf";
 const FONT_BOLD_PATH: &str = "fonts/slkscreb.ttf";
-
 const WALL_TILE_SET_DIR: &str = "sprites/wall_set_b";
 const BACK_TILE_SET_DIR: &str = "sprites/back_set";
 
-const JAR_SIZE: Dim = dim(9, 18);
 const CELL_SIZE: Vec2 = Vec2::new(16., 16.);
 
 const PILL_PALETTE: [Color; 3] = [
@@ -81,7 +82,9 @@ impl Flavour {
 }
 
 #[derive(Component)]
-struct Bug;
+struct Germ;
+
+const SCORE_ZEROS: usize = 7;
 
 #[derive(Resource)]
 struct GameRules {
@@ -137,6 +140,18 @@ impl Pos {
             Dir::Right => self.right(),
         }
     }
+    /// component wise min
+    fn min(mut self, other: Self) -> Self {
+        self.x = self.x.min(other.x);
+        self.y = self.y.min(other.y);
+        self
+    }
+    /// component wise max
+    fn max(mut self, other: Self) -> Self {
+        self.x = self.x.max(other.x);
+        self.y = self.y.max(other.y);
+        self
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
@@ -164,10 +179,10 @@ impl Grid {
     fn y_range(self) -> std::ops::Range<i16> {
         self.pos.y..self.max_y()
     }
-    fn iter(self) -> impl Iterator<Item = Pos> {
-        self.x_range()
-            .flat_map(move |x| self.y_range().map(move |y| pos(x, y)))
-    }
+    // fn iter(self) -> impl Iterator<Item = Pos> {
+    //     self.x_range()
+    //         .flat_map(move |x| self.y_range().map(move |y| pos(x, y)))
+    // }
     fn expand(self, dim: Dim) -> Self {
         grid(self.pos.translate(-dim.w, -dim.h), self.dim.expand(dim))
     }
@@ -180,6 +195,47 @@ impl Grid {
     }
     const fn max_y(self) -> i16 {
         self.pos.y + self.dim.h
+    }
+}
+
+struct GridIter {
+    x_range: std::ops::Range<i16>,
+    y_range: std::ops::Range<i16>,
+    current_x: i16,
+    current_y: i16,
+}
+
+impl Iterator for GridIter {
+    type Item = Pos;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_y < self.y_range.end {
+            let pos = pos(self.current_x, self.current_y);
+            self.current_x += 1;
+
+            if self.current_x == self.x_range.end {
+                self.current_x = self.x_range.start;
+                self.current_y += 1;
+            }
+
+            Some(pos)
+        } else {
+            None
+        }
+    }
+}
+
+impl IntoIterator for Grid {
+    type Item = Pos;
+    type IntoIter = GridIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        GridIter {
+            x_range: self.x_range(),
+            y_range: self.y_range(),
+            current_x: self.pos.x,
+            current_y: self.pos.y,
+        }
     }
 }
 
@@ -208,6 +264,11 @@ impl From<Dim> for Vec2 {
     }
 }
 
+#[derive(Component, Copy, Clone, Default, Debug)]
+struct Marker<T> {
+    _phantom: PhantomData<fn() -> T>,
+}
+
 #[derive(Component)]
 struct PivotPill;
 #[derive(Component)]
@@ -223,28 +284,26 @@ enum GameSet {
     SpawnPill,
     Jar,
     SwapEnds,
+    GamePlay,
+    Effects,
 }
 
 #[derive(Resource)]
-struct Jar {
+struct Organ {
     cells: BiMap<Pos, Entity>,
-    bounds: Grid,
+    spawn_area: Grid,
 }
 
-impl Jar {
-    fn new(dim: Dim) -> Self {
+impl Organ {
+    fn new(spawn_area: Grid) -> Self {
         Self {
             cells: BiMap::default(),
-            bounds: dim.grid(),
+            spawn_area,
         }
     }
 
     fn get(&self, pos: Pos) -> Option<Entity> {
-        if self.bounds.contains(pos) {
-            self.cells.get_by_left(&pos).copied()
-        } else {
-            None
-        }
+        self.cells.get_by_left(&pos).copied()
     }
 
     fn insert(&mut self, pos: Pos, entity: Entity) -> bimap::Overwritten<Pos, Entity> {
@@ -266,25 +325,23 @@ impl Jar {
 
     fn is_empty(&self, pos: Pos) -> bool {
         !self.cells.contains_left(&pos)
-            && (self.bounds.contains(pos)
-                || (self.bounds.x_range().contains(&pos.x) && self.bounds.max_y() <= pos.y))
     }
 
-    fn down_all<'a>(&mut self, targets: impl Iterator<Item = &'a Pos>) {
-        let mut ids = vec![];
-        for pos in targets {
-            ids.push((pos.down(), self.remove(*pos).unwrap()));
+    fn bounds(&self) -> Grid {
+        let mut min = pos(i16::MAX, i16::MAX);
+        let mut max = pos(i16::MIN, i16::MIN);
+        for &cell in self.cells.left_values() {
+            min = min.min(cell);
+            max = max.max(cell);
         }
-
-        for (pos, id) in ids {
-            self.insert(pos, id);
-        }
+        grid(min, dim(max.x - min.x + 1, max.y - min.y + 1))
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, States)]
 enum AppState {
     #[default]
+    TitleScreen,
     Game,
 }
 
@@ -297,6 +354,19 @@ enum GameState {
     PillLanded,
     Collapsing,
     Wait,
+}
+
+#[derive(Resource, Clone, Copy, Debug, Default)]
+struct Score(u64);
+
+#[derive(Resource, Clone, Copy, Debug, Default)]
+struct HighScore(u64);
+
+#[derive(Resource, Default)]
+struct ComboKillCounter(u64);
+
+fn reset_bug_kill_counter(mut counter: ResMut<ComboKillCounter>) {
+    counter.0 = 0;
 }
 
 fn main() {
@@ -314,32 +384,64 @@ fn main() {
                 ..Default::default()
             }),
     )
+    .add_plugin(title_screen::TitleScreenPlugin)
     .init_resource::<PillCommands>()
     .init_resource::<GameRules>()
     .init_resource::<ShadowOffset>()
-    .add_systems(Startup, (setup, spawn_score_display))
-    .add_systems(Update, wait_system.run_if(in_state(GameState::Wait)))
-    .add_systems(OnEnter(GameState::PillFalling), spawn_new_pill)
+    .init_resource::<Score>()
+    .init_resource::<HighScore>()
+    .init_resource::<ComboKillCounter>()
+    .add_event::<KilledSomethingEvent>()
+    .add_event::<SpawnExplosionEvent>()
+    .add_event::<ScorePointsEvent>()
+    .add_startup_system(setup)
+    .add_systems(OnEnter(AppState::Game), (setup_game, spawn_score_display))
+    .add_system(wait_system.run_if(in_state(GameState::Wait)))
+    .add_system(bevy::window::close_on_esc)
+    .add_systems(
+        OnEnter(GameState::PillFalling),
+        (reset_bug_kill_counter, spawn_new_pill).run_if(in_state(AppState::Game)),
+    )
     .add_systems(OnEnter(GameState::Collapsing), collapse_pills)
     .add_systems(
-        PreUpdate,
-        (update_pill_timers.before(GameSet::SpawnPill),).run_if(in_state(GameState::PillFalling)),
+        (update_pill_timers.before(GameSet::SpawnPill),)
+        .in_base_set(PreUpdate)
+        .run_if(in_state(GameState::PillFalling)
+    ),
     )
     .add_state::<AppState>()
     .add_state::<GameState>()
-    .add_event::<SpawnExplosionMessage>()
-    .add_systems(Update, 
+    .add_systems(
+        Update,
+        (
+            update_score_display::<Score>,
+            update_score_display::<HighScore>,
+        )
+            .after(GameSet::Effects),
+    )
+    .add_systems(
+        Update,
+        (explode_on_killed, update_kill_count_and_score)
+            .after(GameSet::GamePlay)
+            .before(GameSet::Effects)
+            .run_if(in_state(AppState::Game)),
+    )
+    .add_systems(
+        Update,
         (
             spawn_explosions.after(GameSet::Jar),
-            velocity_physics,
-            fade_out,
+            velocity_physics.in_set(GameSet::Animation),
+            fade_out.in_set(GameSet::Animation),
             update_flippers.in_set(GameSet::Animation),
-        ).run_if(in_state(AppState::Game)),
+            update_score,
+        )
+            .after(GameSet::GamePlay)
+            .in_set(GameSet::Effects)
+            .run_if(in_state(AppState::Game)),
     )
-    .add_systems(PreUpdate,
-        (
-            update_despawn_timers,
-        ).run_if(in_state(AppState::Game)),
+    .add_systems(
+        PreUpdate,
+        (update_despawn_timers,).run_if(in_state(AppState::Game)),
     )
     .add_systems(
         Update,
@@ -365,53 +467,74 @@ fn main() {
                 .after(GameSet::RotatePill)
                 .after(GameSet::Input),
         )
-            .run_if(in_state(GameState::PillFalling)),
+            .in_set(GameSet::GamePlay)
+            .run_if(in_state(GameState::PillFalling))
+            .run_if(in_state(AppState::Game)),
     )
     .add_systems(
         Update,
-        (search_jar_for_flavour_lines.in_set(GameSet::Jar),)
-            .run_if(in_state(GameState::PillLanded)),
-    );
-
-    if let Ok(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
-        render_app.add_systems(
-            ExtractSchedule,
-            (   
-                        extract_organ_sprites,
-                        extract_wall_sprites,
-                )
-                .after(SpriteSystem::ExtractSprites)
+        (search_jar_for_flavour_lines
+            .in_set(GameSet::Jar)
+            .in_set(GameSet::GamePlay),)
+            .run_if(in_state(GameState::PillLanded))
+            .run_if(in_state(AppState::Game)),
+        );
+        if let Ok(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+            render_app.add_systems(
+                ExtractSchedule,
+                (extract_organ_sprites, extract_wall_sprites).after(SpriteSystem::ExtractSprites)
+                .run_if(|state: Extract<Res<State<AppState>>>|*state.get() == AppState::Game),
         );
     }
 
     app.run();
 }
 
-fn setup(mut commands: Commands, asset_server: Res<AssetServer>, _rules: Res<GameRules>) {
+
+
+fn setup(mut commands: Commands) {
     let mut camera_2d_bundle = Camera2dBundle::default();
-    camera_2d_bundle.transform.scale *= Vec2::splat(0.5).extend(1.0);
-    camera_2d_bundle.transform.translation +=
-        (0.5 * CELL_SIZE * Vec2::from(JAR_SIZE) + 24. * Vec2::Y).extend(0.);
     camera_2d_bundle.camera_2d.clear_color = ClearColorConfig::Custom(Color::MAROON);
     commands.spawn(camera_2d_bundle);
+}
+
+fn setup_game(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    _rules: Res<GameRules>,
+    mut camera_query: Query<&mut Transform, With<Camera2d>>,
+) {
+    let organ_inner_area = dim(9, 20).grid();
+    let spawn_area = grid(pos(4, 18), dim(1, 2));
+    let germ_max_y = 15;
+    let mut camera_transform = camera_query.single_mut();
+    camera_transform.scale *= Vec2::splat(0.5).extend(1.0);
+    camera_transform.translation +=
+        (0.5 * CELL_SIZE * Vec2::from(organ_inner_area.dim) + 24. * Vec2::Y).extend(0.);
+
     commands.insert_resource(OrganGeometry {
         translation: Vec3::ZERO,
         cell_size: CELL_SIZE,
     });
 
-    let mut jar = Jar::new(JAR_SIZE);
+    let mut jar = Organ::new(spawn_area);
     let wall_textures = load_typed_folder(&asset_server, WALL_TILE_SET_DIR).unwrap();
     let back_textures = load_typed_folder(&asset_server, BACK_TILE_SET_DIR).unwrap();
-    spawn_organ(&mut commands, &wall_textures, &back_textures, JAR_SIZE);
+    spawn_organ_walls(
+        &mut commands,
+        &wall_textures,
+        &back_textures,
+        organ_inner_area,
+        &mut jar,
+    );
 
-    spawn_germs(&mut commands, 10, &mut jar, &asset_server);
+    let spawns = organ_inner_area
+        .into_iter()
+        .filter(|pos| pos.y <= germ_max_y);
+    spawn_germs(&mut commands, 10, &mut jar, spawns, &asset_server);
+
     commands.insert_resource(jar);
 }
-#[derive(Component)]
-struct ScoreText;
-
-#[derive(Component)]
-struct HighScoreText;
 
 fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
     let font = asset_server.load(FONT_PATH);
@@ -453,13 +576,16 @@ fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
                 .with_children(|parent| {
                     parent.spawn(TextBundle::from_section("score", text_style_1.clone()));
                     parent
-                        .spawn(TextBundle::from_section("000000", text_style_2.clone()))
-                        .insert(ScoreText);
+                        .spawn(TextBundle::from_section(
+                            format_score(0),
+                            text_style_2.clone(),
+                        ))
+                        .insert(Marker::<Score>::default());
                 });
 
             parent
-            .spawn(NodeBundle {
-            style: Style {
+                .spawn(NodeBundle {
+                    style: Style {
                         size: Size::new(Val::Px(160.), Val::Px(80.)),
                         margin: UiRect::all(Val::Px(20.)),
                         flex_direction: FlexDirection::Column,
@@ -474,8 +600,11 @@ fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
                 .with_children(|parent| {
                     parent.spawn(TextBundle::from_section("hiscore", text_style_1.clone()));
                     parent
-                        .spawn(TextBundle::from_section("000000", text_style_2.clone()))
-                        .insert(HighScoreText);
+                        .spawn(TextBundle::from_section(
+                            format_score(0),
+                            text_style_2.clone(),
+                        ))
+                        .insert(Marker::<HighScore>::default());
                 });
         });
 }
@@ -484,43 +613,50 @@ fn gray(value: f32) -> Color {
     Color::rgb(value, value, value)
 }
 
-fn spawn_organ(
+fn spawn_organ_walls(
     commands: &mut Commands,
     wall_textures: &[Handle<Image>],
     back_textures: &[Handle<Image>],
-    dim: Dim,
+    organ_inner_area: Grid,
+    organ: &mut Organ,
 ) {
     let rng = &mut thread_rng();
-    let inner = dim.grid();
+    let inner = organ_inner_area;
     let outer = inner.expand(Dim::ONE);
-    for pos in outer.iter() {
+
+    for pos in outer {
         if inner.contains(pos) {
-            commands.spawn(TileBundle {
-                tint: Tint(gray(0.75)),
-                ..TileBundle::random(rng, back_textures, pos, Depth::OrganBack)
-            });
+            commands.spawn((
+                back_textures.choose(rng).unwrap().clone(),
+                pos,
+                Depth::OrganBack,
+                Tint(gray(0.7)),
+                Dir::random(rng),
+                Flip::random(rng),
+                Visibility::Visible,
+                ComputedVisibility::default(),
+            ));
         } else if pos.y < inner.max_y() {
-            let wx = 
-                if pos.x == outer.pos.x {
-                    -1.
-                } else if pos.x == inner.max_x() {
-                    1.
-                } else {
-                    0.
-                };
-            let wy =
-                if pos.y == outer.pos.y {
-                    -1.
-                } else { 
-                    0. 
-                };
+            let wx = if pos.x == outer.pos.x {
+                -1.
+            } else if pos.x == inner.max_x() {
+                1.
+            } else {
+                0.
+            };
+            let wy = if pos.y == outer.pos.y { -1. } else { 0. };
             let w = 8. * vec2(wx, wy);
-                         
-            commands
-                .spawn((TileBundle::random(rng, wall_textures, pos, Depth::OrganWall).add_shadow(), WallEffect(w)));
-            
+
+            let id = commands
+                .spawn((
+                    WallBundle::random(rng, wall_textures, pos, Depth::OrganWall).add_shadow(),
+                    WallEffect(w),
+                ))
+                .id();
+            organ.insert(pos, id);
         } else {
-            continue;
+            let id = commands.spawn((pos, Wall)).id();
+            organ.insert(pos, id);
         };
     }
 }
@@ -537,16 +673,15 @@ fn load_typed_folder<T: TypeUuid + 'static + Send + Sync>(
     Ok(image_handles)
 }
 
-fn spawn_germs(commands: &mut Commands, count: usize, jar: &mut Jar, asset_server: &AssetServer) {
+fn spawn_germs(
+    commands: &mut Commands,
+    count: usize,
+    organ: &mut Organ,
+    germ_spawn_points: impl IntoIterator<Item = Pos>,
+    asset_server: &AssetServer,
+) {
     let mut rng = rand::thread_rng();
-    let bounds = Grid {
-        dim: Dim {
-            h: jar.bounds.dim.h - 3,
-            ..jar.bounds.dim
-        },
-        ..jar.bounds
-    };
-    let mut cells: Vec<Pos> = bounds.iter().collect();
+    let mut cells: Vec<Pos> = germ_spawn_points.into_iter().collect();
     cells.shuffle(&mut rng);
     let n = count.min(cells.len());
     for (i, cell) in cells.into_iter().take(n).enumerate() {
@@ -560,14 +695,18 @@ fn spawn_germs(commands: &mut Commands, count: usize, jar: &mut Jar, asset_serve
                         flavour,
                     )
                     .depth(Depth::Bug),
-                    Bug,
+                    Germ,
                     Flip::default(),
-                    Flipper { remaining: 0.35, total: 0.35 },
+                    Flipper {
+                        remaining: 0.35,
+                        total: 0.35,
+                    },
+                    Exploder,
                 )
-                .add_shadow(),
+                    .add_shadow(),
             )
             .id();
-        jar.insert(cell, bug_id);
+        organ.insert(cell, bug_id);
     }
 }
 
@@ -581,13 +720,14 @@ struct PillPart;
 struct Joined(Entity);
 
 fn spawn_new_pill(
+    jar: OrganMap,
     active_pill_query: Query<Entity, With<ActivePill>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     rules: Res<GameRules>,
 ) {
     let rng = &mut thread_rng();
-    let position = pos(4, 20);
+    let position = jar.map.spawn_area.pos;
     let pill_bottom = *Flavour::ALL.choose(rng).unwrap();
     let pill_top = *Flavour::ALL.choose(rng).unwrap();
     let pill_texture = asset_server.load(PILL_SPRITE_PATH);
@@ -606,6 +746,7 @@ fn spawn_new_pill(
                 XMoveTimer(rules.horizontal_move_delay),
                 PillPart,
                 Joined(b),
+                Exploder,
             )
                 .add_shadow(),
         );
@@ -618,6 +759,7 @@ fn spawn_new_pill(
                 ActivePill,
                 PillPart,
                 Joined(a),
+                Exploder,
             )
                 .add_shadow(),
         );
@@ -645,7 +787,7 @@ fn update_pill_timers(
 }
 
 #[derive(Bundle)]
-struct TileBundle {
+struct WallBundle {
     texture: Handle<Image>,
     pos: Pos,
     depth: Depth,
@@ -657,7 +799,7 @@ struct TileBundle {
     wall: Wall,
 }
 
-impl TileBundle {
+impl WallBundle {
     fn new_wall(texture: Handle<Image>, pos: Pos) -> Self {
         Self {
             texture,
@@ -694,35 +836,6 @@ impl TileBundle {
             tint: Color::WHITE.into(),
             dir: Dir::random(rng),
             flip: Flip::random(rng),
-            visibility: Visibility::Visible,
-            computed_visibility: ComputedVisibility::default(),
-            wall: Wall,
-        }
-    }
-}
-
-#[derive(Bundle)]
-struct WallBundle {
-    texture: Handle<Image>,
-    pos: Pos,
-    depth: Depth,
-    dir: Dir,
-    flip: Flip,
-    tint: Tint,
-    visibility: Visibility,
-    computed_visibility: ComputedVisibility,
-    wall: Wall,
-}
-
-impl TileBundle {
-    fn new(texture: Handle<Image>, pos: Pos) -> Self {
-        Self {
-            texture,
-            pos,
-            depth: Depth::OrganWall,
-            tint: Color::WHITE.into(),
-            dir: Dir::Up,
-            flip: Flip::default(),
             visibility: Visibility::Visible,
             computed_visibility: ComputedVisibility::default(),
             wall: Wall,
@@ -812,7 +925,7 @@ fn orient_pill(
     pill_commands: ResMut<PillCommands>,
     mut pivot_pill_query: Query<(&Pos, &mut Dir), (With<PivotPill>, With<ActivePill>)>,
     mut end_pill_query: Query<(&mut Pos, &mut Dir), (Without<PivotPill>, With<ActivePill>)>,
-    jar: Res<Jar>,
+    organ_map: OrganMap,
 ) {
     let Some(dir) = pill_commands.dir else { return; };
     if dir.is_horizontal() {
@@ -827,7 +940,7 @@ fn orient_pill(
             end_dir.rotate_right()
         };
         let new_end = pivot_pos.step(new_dir);
-        if jar.is_empty(new_end) {
+        if organ_map.is_empty(new_end) {
             *end_pos = new_end;
             *end_dir = new_dir;
             *pivot_dir = new_dir.opposite();
@@ -886,7 +999,7 @@ fn handle_input(keyboard: Res<Input<KeyCode>>, mut pill_command: ResMut<PillComm
     }
 
     pill_command.immediate_move = false;
-    if keyboard.pressed(KeyCode::Left) {        
+    if keyboard.pressed(KeyCode::Left) {
         pill_command.x_move -= 1;
         if keyboard.just_pressed(KeyCode::Left) {
             pill_command.immediate_move = true;
@@ -913,7 +1026,8 @@ fn move_pill(
     mut pivot_pill_query: Query<(&mut Pos, &mut XMoveTimer), (With<PivotPill>, With<ActivePill>)>,
     mut end_pill_query: Query<&mut Pos, (Without<PivotPill>, With<ActivePill>)>,
     pill_commands: Res<PillCommands>,
-    jar: Res<Jar>,
+    //jar: Res<Organ>,
+    organ: OrganMap,
 ) {
     let (mut pivot_pos, mut delay) = pivot_pill_query.single_mut();
     let mut end_pos = end_pill_query.single_mut();
@@ -924,7 +1038,7 @@ fn move_pill(
             let new_end_pos = end_pos.translate(pill_commands.x_move, 0);
             if [new_pivot_pos, new_end_pos]
                 .iter()
-                .all(|&pos| jar.is_empty(pos))
+                .all(|&pos| organ.map.is_empty(pos))
             {
                 *pivot_pos = new_pivot_pos;
                 *end_pos = new_end_pos;
@@ -938,7 +1052,8 @@ fn drop_pill(
     mut pivot_query: Query<(Entity, &mut Pos, &mut DropTimer), (With<ActivePill>, With<PivotPill>)>,
     mut end_query: Query<(Entity, &mut Pos), (With<ActivePill>, Without<PivotPill>)>,
     rules: Res<GameRules>,
-    mut jar: ResMut<Jar>,
+    //mut jar: ResMut<Organ>,
+    mut organ: OrganMap,
     mut commands: Commands,
     mut next_game_state: ResMut<NextState<GameState>>,
 ) {
@@ -948,11 +1063,14 @@ fn drop_pill(
         drop_timer.0 = rules.drop_delay;
         let next_pivot_pos = pivot_pos.down();
         let next_end_pos = end_pos.down();
-        if jar.is_empty(next_pivot_pos) && jar.is_empty(next_end_pos) {
+        if organ.map.is_empty(next_pivot_pos) && organ.map.is_empty(next_end_pos) {
             *pivot_pos = next_pivot_pos;
             *end_pos = next_end_pos;
         } else {
-            jar.insert_joined([(*pivot_pos, pivot), (*end_pos, end)]);
+            organ
+                .map
+                .insert_joined([(*pivot_pos, pivot), (*end_pos, end)]);
+
             commands
                 .entity(pivot)
                 .remove::<(ActivePill, PivotPill, DropTimer, XMoveTimer)>();
@@ -964,7 +1082,7 @@ fn drop_pill(
 
 /// find rows and columns of pills and bugs with matching flavours
 fn find_flavour_lines(
-    pills: impl Fn(Pos) -> Option<Flavour>,
+    flavour: impl Fn(Pos) -> Option<Flavour>,
     bounds: Grid,
     min_flavour_line_len: i16,
 ) -> HashSet<Pos> {
@@ -972,7 +1090,7 @@ fn find_flavour_lines(
 
     for x in bounds.x_range() {
         for y in bounds.y_range() {
-            let p = pills(pos(x, y));
+            let p = flavour(pos(x, y));
             if p.is_none() {
                 continue;
             }
@@ -982,7 +1100,7 @@ fn find_flavour_lines(
             if y + min_flavour_line_len <= bounds.max_y() {
                 let all_match = (y + 1..y + min_flavour_line_len)
                     .map(|y| pos(x, y))
-                    .all(|q| pills(q) == Some(p));
+                    .all(|q| flavour(q) == Some(p));
 
                 if all_match {
                     for y in y..y + min_flavour_line_len {
@@ -995,7 +1113,7 @@ fn find_flavour_lines(
             if x + min_flavour_line_len <= bounds.max_x() {
                 let all_match = (x + 1..x + min_flavour_line_len)
                     .map(|x| pos(x, y))
-                    .all(|q| pills(q) == Some(p));
+                    .all(|q| flavour(q) == Some(p));
 
                 if all_match {
                     for x in x..x + min_flavour_line_len {
@@ -1011,26 +1129,18 @@ fn find_flavour_lines(
 fn search_jar_for_flavour_lines(
     asset_server: Res<AssetServer>,
     mut commands: Commands,
-    pill_bugs_query: Query<&Flavour>,
-    mut jar: ResMut<Jar>,
+    mut organ: OrganMap,
     rules: Res<GameRules>,
     mut next_state: ResMut<NextState<GameState>>,
     mut joined_query: Query<&Joined>,
     mut image_query: Query<&mut Handle<Image>>,
-    mut spawn_explosion: EventWriter<SpawnExplosionMessage>,
+    mut killed_event: EventWriter<KilledSomethingEvent>,
 ) {
-    let matches = find_flavour_lines(
-        |pos| {
-            jar.get(pos)
-                .map(|entity| pill_bugs_query.get(entity).cloned().unwrap())
-        },
-        jar.bounds,
-        rules.matches,
-    );
+    let matches = find_flavour_lines(|pos| organ.flavour(pos), organ.map.bounds(), rules.matches);
     let mut removed = HashSet::default();
     if !matches.is_empty() {
         for pos in matches {
-            let entity = jar.remove(pos).unwrap();
+            let entity = organ.map.remove(pos).unwrap();
             if let Ok(join) = joined_query.get_mut(entity) {
                 if !removed.contains(&join.0) {
                     let mut image = image_query.get_mut(join.0).unwrap();
@@ -1038,8 +1148,7 @@ fn search_jar_for_flavour_lines(
                     commands.entity(join.0).remove::<Joined>();
                 }
             }
-            let color = pill_bugs_query.get(entity).unwrap().color();
-            spawn_explosion.send(SpawnExplosionMessage { pos, color });
+            killed_event.send(KilledSomethingEvent(entity));
             commands.entity(entity).despawn();
             removed.insert(entity);
         }
@@ -1054,6 +1163,44 @@ fn search_jar_for_flavour_lines(
             next: GameState::PillFalling,
         });
         next_state.set(GameState::Wait);
+    }
+}
+
+struct KilledSomethingEvent(Entity);
+
+#[derive(Component)]
+struct Exploder;
+
+fn explode_on_killed(
+    mut kill_events: EventReader<KilledSomethingEvent>,
+    mut spawn_explosion: EventWriter<SpawnExplosionEvent>,
+    query: Query<(&Pos, &Flavour), With<Exploder>>,
+) {
+    for KilledSomethingEvent(id) in kill_events.iter() {
+        if let Ok((pos, flavour)) = query.get(*id) {
+            spawn_explosion.send(SpawnExplosionEvent {
+                pos: *pos,
+                color: flavour.color(),
+            });
+        }
+    }
+}
+
+fn update_kill_count_and_score(
+    mut kill_events: EventReader<KilledSomethingEvent>,
+    mut score_points: EventWriter<ScorePointsEvent>,
+    mut combo_kill_counter: ResMut<ComboKillCounter>,
+    query: Query<(), With<Germ>>,
+) {
+    for KilledSomethingEvent(id) in kill_events.iter() {
+        if query.contains(*id) {
+            combo_kill_counter.0 += 1;
+            let mut points = 0;
+            for i in 1..=combo_kill_counter.0 {
+                points += 10 * i;
+            }
+            score_points.send(ScorePointsEvent(points));
+        }
     }
 }
 
@@ -1200,7 +1347,7 @@ fn extract_organ_sprites(
     shadow_offset: Extract<Res<ShadowOffset>>,
     sprite_query: Extract<
         Query<
-         (
+            (
                 Entity,
                 &ComputedVisibility,
                 &Pos,
@@ -1210,9 +1357,9 @@ fn extract_organ_sprites(
                 &Depth,
                 Option<&Flip>,
                 Option<&Shadow>,
-            ), 
-            Without<WallEffect>
-        >
+            ),
+            Without<WallEffect>,
+        >,
     >,
     time: Extract<Res<Time>>,
 ) {
@@ -1228,7 +1375,7 @@ fn extract_organ_sprites(
         let translation = organ_geometry.map_pos(*pos);
         let size = organ_geometry.cell_size;
         let m = Mat3A::from_rotation_z(orientation.angle());
-       
+
         if shadow.is_some() {
             extracted_sprites.sprites.push(ExtractedSprite {
                 entity,
@@ -1266,8 +1413,7 @@ fn extract_organ_sprites(
     }
 }
 
-
-fn extract_wall_sprites(
+fn extract_wall_sprites(    
     mut extracted_sprites: ResMut<ExtractedSprites>,
     organ_geometry: Extract<Res<OrganGeometry>>,
     shadow_offset: Extract<Res<ShadowOffset>>,
@@ -1282,7 +1428,7 @@ fn extract_wall_sprites(
             Option<&Flip>,
             Option<&Shadow>,
             &WallEffect,
-        )>
+        )>,
     >,
     time: Extract<Res<Time>>,
 ) {
@@ -1299,7 +1445,7 @@ fn extract_wall_sprites(
 
         let flip = flip.copied().unwrap_or_default();
         let size = organ_geometry.cell_size + wall_effect.0.abs() * s;
-        let translation = organ_geometry.map_pos(*pos) +  (0.5 * wall_effect.0 * s).extend(0.);
+        let translation = organ_geometry.map_pos(*pos) + (0.5 * wall_effect.0 * s).extend(0.);
         if shadow.is_some() {
             extracted_sprites.sprites.push(ExtractedSprite {
                 entity,
@@ -1356,15 +1502,15 @@ fn wait_system(
 
 fn collapse_pills(
     mut commands: Commands,
-    mut jar: ResMut<Jar>,
+    mut jar: ResMut<Organ>,
     mut pill_query: Query<&mut Pos, With<PillPart>>,
     join_query: Query<&Joined>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
     let mut drop = false;
-    for row in jar.bounds.y_range() {
+    for row in jar.bounds().y_range() {
         let spaces: Vec<(Pos, Entity)> = jar
-            .bounds
+            .bounds()
             .x_range()
             .map(|x| pos(x, row))
             .filter(|&pos| jar.is_empty(pos))
@@ -1405,20 +1551,15 @@ fn collapse_pills(
     next_state.set(GameState::Wait);
 }
 
-
-struct SpawnExplosionMessage {
+struct SpawnExplosionEvent {
     pos: Pos,
     color: Color,
 }
 
-#[derive(Component)]
-#[derive(Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 struct Velocity(Vec2);
 
-fn velocity_physics(
-    time: Res<Time>,
-    mut query: Query<(&Velocity, &mut Transform)>,
-) {
+fn velocity_physics(time: Res<Time>, mut query: Query<(&Velocity, &mut Transform)>) {
     for (v, mut tf) in query.iter_mut() {
         let v = v.0 * time.delta_seconds();
         tf.translation.x += v.x;
@@ -1426,14 +1567,10 @@ fn velocity_physics(
     }
 }
 
-#[derive(Component)]
-#[derive(Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 struct FadeOut(f32);
 
-fn fade_out(
-    time: Res<Time>,
-    mut query: Query<(&mut Sprite, &FadeOut)>,
-) {
+fn fade_out(time: Res<Time>, mut query: Query<(&mut Sprite, &FadeOut)>) {
     for (mut s, f) in query.iter_mut() {
         if let Some(ref mut c) = s.custom_size {
             *c *= 1. - f.0 * time.delta_seconds();
@@ -1441,9 +1578,8 @@ fn fade_out(
     }
 }
 
-
 fn spawn_explosions(
-    mut explosion_events: EventReader<SpawnExplosionMessage>,
+    mut explosion_events: EventReader<SpawnExplosionEvent>,
     mut commands: Commands,
     organ_geometry: Res<OrganGeometry>,
 ) {
@@ -1451,84 +1587,139 @@ fn spawn_explosions(
     let o = organ_geometry.cell_size.x;
     let range_distribution = Uniform::new(0., 0.35 * o);
     let angle_distribution = Uniform::new(0., TAU);
-    let speed_distribution = Uniform::new(0.5 * o , 0.9 * o);
-    
+    let speed_distribution = Uniform::new(0.5 * o, 0.9 * o);
+
     for e in explosion_events.iter() {
-        commands.spawn((SpatialBundle {
-            transform: Transform::from_translation(organ_geometry.map_pos(e.pos)),
-            ..Default::default()
-        }, 
-        DespawnTimer(0.66),
-    )
-
-    ).with_children(|parent| {
-            for _ in 0..20 {
-                let s: f32 = *[2., 3., 4.].choose(rng).unwrap();
-                let displacement = rng.sample(range_distribution);
-                let dir = rng.sample(angle_distribution);
-                let speed = rng.sample(speed_distribution);
-                let q = Quat::from_rotation_z(dir);
-                parent.spawn(SpatialBundle {
-                    transform: Transform::from_rotation(q),
+        commands
+            .spawn((
+                SpatialBundle {
+                    transform: Transform::from_translation(organ_geometry.map_pos(e.pos)),
                     ..Default::default()
-                }).with_children(|parent| {
-                    parent.spawn((
-                        SpriteBundle {
-                            sprite: Sprite {
-                                color: e.color,
-                                custom_size: Some(Vec2::splat(s)),
-                                ..Default::default()
-                            },
+                },
+                DespawnTimer(0.66),
+            ))
+            .with_children(|parent| {
+                for _ in 0..20 {
+                    let s: f32 = *[3., 4., 5.].choose(rng).unwrap();
+                    let displacement = rng.sample(range_distribution);
+                    let dir = rng.sample(angle_distribution);
+                    let speed = rng.sample(speed_distribution);
+                    let q = Quat::from_rotation_z(dir);
+                    parent
+                        .spawn(SpatialBundle {
+                            transform: Transform::from_rotation(q),
+                            ..Default::default()
+                        })
+                        .with_children(|parent| {
+                            parent.spawn((
+                                SpriteBundle {
+                                    sprite: Sprite {
+                                        color: e.color,
+                                        custom_size: Some(Vec2::splat(s)),
+                                        ..Default::default()
+                                    },
+                                    transform: Transform {
+                                        translation: displacement * Vec3::Y
+                                            + Depth::Top.z() * Vec3::Z,
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                },
+                                Velocity(speed * Vec2::Y),
+                                FadeOut(1.75),
+                            ));
+                        });
+
+                    parent
+                        .spawn(SpatialBundle {
                             transform: Transform {
-                                translation: displacement * Vec3::Y + Depth::Top.z() * Vec3::Z,
+                                translation: SHADOW_OFFSET,
+                                rotation: q,
                                 ..Default::default()
                             },
                             ..Default::default()
-                        },
-                        Velocity(speed * Vec2::Y),
-                        FadeOut(1.75),
-                    ));
-                });
-
-                parent.spawn(SpatialBundle {
-                    transform: Transform {
-                        translation: SHADOW_OFFSET,
-                        rotation: q,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }).with_children(|parent| {
-                    parent.spawn((
-                        SpriteBundle {
-                            sprite: Sprite {
-                                color: Color::BLACK.with_a(SHADOW_ALPHA),
-                                custom_size: Some(Vec2::splat(s)),
-                                ..Default::default()
-                            },
-                            transform: Transform {
-                                translation: displacement * Vec3::Y + Depth::Shadow.z() * Vec3::Z,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        },
-                        Velocity(speed * Vec2::Y),
-                        FadeOut(1.75),
-                    ));
-                });
-                
-            }
-        });
+                        })
+                        .with_children(|parent| {
+                            parent.spawn((
+                                SpriteBundle {
+                                    sprite: Sprite {
+                                        color: Color::BLACK.with_a(SHADOW_ALPHA),
+                                        custom_size: Some(Vec2::splat(s)),
+                                        ..Default::default()
+                                    },
+                                    transform: Transform {
+                                        translation: displacement * Vec3::Y
+                                            + Depth::Shadow.z() * Vec3::Z,
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                },
+                                Velocity(speed * Vec2::Y),
+                                FadeOut(1.75),
+                            ));
+                        });
+                }
+            });
     }
 }
 
 #[derive(Component)]
 struct Wall;
 
+#[derive(Copy, Clone, Debug)]
+enum Tile {
+    Germ(Flavour),
+    Pill(Flavour),
+    Wall,
+}
+
+impl Tile {
+    fn flavour(self) -> Option<Flavour> {
+        match self {
+            Tile::Germ(f) => Some(f),
+            Tile::Pill(f) => Some(f),
+            Tile::Wall => None,
+        }
+    }
+}
+
 #[derive(SystemParam)]
-struct JarManager<'w, 's> {
-    jar: ResMut<'w, Jar>,
-    pill_query: Query<'w, 's, &'static PillPart>,
-    pos_query: Query<'w, 's, &'static mut Pos>,
+struct OrganMap<'w, 's> {
+    map: ResMut<'w, Organ>,
+    wall_query: Query<'w, 's, Entity, With<Wall>>,
+    pill_query: Query<'w, 's, Entity, (With<PillPart>, Without<ActivePill>)>,
+    germ_query: Query<'w, 's, Entity, With<Germ>>,
+    flavour_query: Query<'w, 's, &'static mut Flavour, Without<ActivePill>>,
+}
+
+impl<'w, 's> OrganMap<'w, 's> {
+    fn tile(&self, pos: Pos) -> Option<Tile> {
+        self.id(pos).and_then(|entity| {
+            if self.wall_query.get(entity).is_ok() {
+                Some(Tile::Wall)
+            } else if self.pill_query.get(entity).is_ok() {
+                Some(Tile::Pill(self.flavour(pos).unwrap()))
+            } else if self.germ_query.get(entity).is_ok() {
+                Some(Tile::Germ(self.flavour(pos).unwrap()))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn id(&self, pos: Pos) -> Option<Entity> {
+        self.map.get(pos)
+    }
+
+    fn is_empty(&self, pos: Pos) -> bool {
+        self.map.is_empty(pos)
+    }
+
+    fn flavour(&self, pos: Pos) -> Option<Flavour> {
+        self.id(pos)
+            .map(|id| self.flavour_query.get(id).copied().ok())
+            .flatten()
+    }
 }
 
 #[derive(Component)]
@@ -1545,7 +1736,6 @@ fn update_despawn_timers(
             commands.entity(e).despawn_recursive();
         }
     });
-
 }
 
 #[derive(Component)]
@@ -1554,10 +1744,7 @@ struct Flipper {
     total: f32,
 }
 
-fn update_flippers(
-    time: Res<Time>,
-    mut flip_query: Query<(&mut Flip, &mut Flipper)>
-) {
+fn update_flippers(time: Res<Time>, mut flip_query: Query<(&mut Flip, &mut Flipper)>) {
     flip_query.for_each_mut(|(mut flip, mut flipper)| {
         flipper.remaining -= time.delta_seconds();
         if flipper.remaining < 0. {
@@ -1569,3 +1756,103 @@ fn update_flippers(
 
 #[derive(Component)]
 struct WallEffect(Vec2);
+
+struct ScorePointsEvent(u64);
+
+fn update_score(
+    mut event_reader: EventReader<ScorePointsEvent>,
+    mut score: ResMut<Score>,
+    mut high_score: ResMut<HighScore>,
+) {
+    for points_event in event_reader.iter() {
+        score.0 += points_event.0;
+    }
+    high_score.0 = high_score.0.max(score.0);
+}
+
+fn format_score(points: u64) -> String {
+    format!("{:0width$}", points, width = SCORE_ZEROS)
+}
+
+trait Valuable<T> {
+    fn value(&self) -> T;
+}
+
+impl Valuable<u64> for Score {
+    fn value(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Valuable<u64> for HighScore {
+    fn value(&self) -> u64 {
+        self.0
+    }
+}
+
+fn update_score_display<T: Resource + Valuable<u64>>(
+    score: Res<T>,
+    mut score_text_query: Query<&mut Text, With<Marker<T>>>,
+) {
+    if score.is_changed() {
+        for mut text in score_text_query.iter_mut() {
+            text.sections[0].value = format_score(score.value());
+        }
+    }
+}
+
+fn sprite_rect(min: Vec3, size: Vec2, color: Color) -> SpriteBundle {
+    SpriteBundle {
+        sprite: Sprite {
+            color,
+            custom_size: Some(size),
+            anchor: bevy::sprite::Anchor::BottomLeft,
+            ..Default::default()
+        },
+        transform: Transform::from_translation(min),
+        ..Default::default()
+    }
+}
+
+fn spawn_bordered_sprite_rect(
+    commands: &mut Commands,
+    min: Vec3,
+    size: Vec2,
+    border_thickness: f32,
+    border_color: Color,
+    color: Color,
+) -> Entity {
+    commands
+        .spawn(sprite_rect(min, size, border_color))
+        .with_children(|parent| {
+            parent.spawn(sprite_rect(
+                min + Vec2::splat(border_thickness).extend(0.),
+                size - 2.0 * Vec2::splat(border_thickness),
+                color,
+            ));
+        })
+        .id()
+}
+
+fn spawn_pipe_wall(
+    commands: &mut Commands,
+    position: Vec3,
+    side_color: Color,
+    geometry: OrganGeometry,
+    size: Vec2,
+) {
+    // spawn pipe back
+    commands.spawn(SpriteBundle {
+        sprite: Sprite {
+            color: todo!(),
+            custom_size: todo!(),
+            ..Default::default()
+        },
+        transform: todo!(),
+        ..Default::default()
+    });
+
+    // spawn left
+
+    // spawn right
+}
