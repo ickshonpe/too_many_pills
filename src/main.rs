@@ -1,8 +1,10 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::too_many_arguments)]
-mod title_screen;
+mod debug;
 mod input;
+mod title_screen;
 
+use bevy::a11y::accesskit::Orientation;
 use bevy::core_pipeline::clear_color::ClearColorConfig;
 use bevy::ecs::system::SystemParam;
 use bevy::math::vec2;
@@ -11,23 +13,28 @@ use bevy::math::Affine3A;
 use bevy::math::Mat3A;
 use bevy::prelude::*;
 use bevy::reflect::TypeUuid;
-use bevy::render::camera;
 use bevy::render::texture::DEFAULT_IMAGE_HANDLE;
 use bevy::render::Extract;
 use bevy::sprite::ExtractedSprite;
 use bevy::sprite::ExtractedSprites;
 use bevy::sprite::SpriteSystem;
+use bevy::text;
 use bevy::utils::HashSet;
 use bevy::window::WindowResolution;
 use bimap::BiMap;
+use debug::DebugPlugin;
+use input::PlayerCommand;
+use input::PlayerInput;
 use rand::distributions::Uniform;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rand::Rng;
+use std::collections::VecDeque;
 use std::f32::consts::FRAC_PI_2;
 use std::f32::consts::PI;
 use std::f32::consts::TAU;
 use std::marker::PhantomData;
+use std::thread::spawn;
 const BUG_SPRITE_PATHS: [&str; 3] = [
     "sprites/bug-d.png",
     "sprites/bug-b.png",
@@ -80,6 +87,9 @@ impl Flavour {
         BUG_SPRITE_PATHS[self as usize]
     }
 }
+
+#[derive(Component)]
+struct GameUiElement;
 
 #[derive(Component)]
 struct Germ;
@@ -286,7 +296,12 @@ enum GameSet {
     SwapEnds,
     GamePlay,
     Effects,
+    UpdateVitalsPill,
+    UpdateVitalsGerm,
 }
+
+#[derive(Component)]
+pub struct PillSpriteQueueMarker;
 
 #[derive(Resource)]
 struct Organ {
@@ -347,13 +362,15 @@ enum AppState {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, States)]
 enum GameState {
-    /// pill falling
     #[default]
+    Inactive,
+    /// pill falling
     PillFalling,
     /// pill landed on surface
     PillLanded,
     Collapsing,
     Wait,
+    GameOver,
 }
 
 #[derive(Resource, Clone, Copy, Debug, Default)]
@@ -376,7 +393,7 @@ fn main() {
             .set(ImagePlugin::default_nearest())
             .set(WindowPlugin {
                 primary_window: Some(Window {
-                    resolution: WindowResolution::new(400., 800.),
+                    resolution: WindowResolution::new(800., 900.),
                     title: "pills".to_string(),
                     resizable: false,
                     ..Default::default()
@@ -385,29 +402,54 @@ fn main() {
             }),
     )
     .add_plugin(title_screen::TitleScreenPlugin)
+    .add_plugin(input::PlayerInputPlugin)
     .init_resource::<PillCommands>()
     .init_resource::<GameRules>()
     .init_resource::<ShadowOffset>()
     .init_resource::<Score>()
     .init_resource::<HighScore>()
     .init_resource::<ComboKillCounter>()
+    .init_resource::<PillQueue>()
+    .init_resource::<Vitals>()
+    .init_resource::<Danger>()
+    .init_resource::<Level>()
+    .init_resource::<CauseOfDeath>()
     .add_event::<KilledSomethingEvent>()
     .add_event::<SpawnExplosionEvent>()
     .add_event::<ScorePointsEvent>()
-    .add_startup_system(setup)
-    .add_systems(OnEnter(AppState::Game), (setup_game, spawn_score_display))
-    .add_system(wait_system.run_if(in_state(GameState::Wait)))
-    .add_system(bevy::window::close_on_esc)
+    .add_systems(Startup, setup)
+    .add_systems(
+        OnEnter(AppState::Game),
+        (setup_game, spawn_score_display, spawn_vitals_display,
+        spawn_level_display),
+    )
+    .add_systems(
+        OnEnter(GameState::GameOver),
+        spawn_game_over_message
+    )
+    .add_systems(
+        Update,
+        wait_game_over.run_if(in_state(GameState::GameOver))
+    )
+    .add_systems(OnExit(AppState::Game), despawn_game_elements)
+    .add_systems(
+        Update,
+        wait_system
+            .run_if(in_state(GameState::Wait))
+            .run_if(in_state(AppState::Game)),
+    )
+    .add_systems(Update, bevy::window::close_on_esc)
     .add_systems(
         OnEnter(GameState::PillFalling),
         (reset_bug_kill_counter, spawn_new_pill).run_if(in_state(AppState::Game)),
     )
     .add_systems(OnEnter(GameState::Collapsing), collapse_pills)
     .add_systems(
-        (update_pill_timers.before(GameSet::SpawnPill),)
-        .in_base_set(PreUpdate)
-        .run_if(in_state(GameState::PillFalling)
-    ),
+        PreUpdate,
+        (update_pill_timers
+            .before(GameSet::SpawnPill)
+            .run_if(in_state(AppState::Game)))
+        .run_if(in_state(GameState::PillFalling)),
     )
     .add_state::<AppState>()
     .add_state::<GameState>()
@@ -416,12 +458,25 @@ fn main() {
         (
             update_score_display::<Score>,
             update_score_display::<HighScore>,
+            update_danger,
+            update_vitals_display,
+            update_level_display,
         )
-            .after(GameSet::Effects),
+            .after(GameSet::Effects)
+            .run_if(in_state(AppState::Game)),
     )
     .add_systems(
         Update,
-        (explode_on_killed, update_kill_count_and_score)
+        (
+            explode_on_killed,
+            update_kill_count_and_score,
+            update_vitals_on_kill_pill
+                .in_set(GameSet::UpdateVitalsPill)
+                .before(GameSet::UpdateVitalsGerm),
+            update_vitals_on_kill_germ
+                .in_set(GameSet::UpdateVitalsGerm)
+                .after(GameSet::UpdateVitalsPill),
+        )
             .after(GameSet::GamePlay)
             .before(GameSet::Effects)
             .run_if(in_state(AppState::Game)),
@@ -473,29 +528,38 @@ fn main() {
     )
     .add_systems(
         Update,
-        (search_jar_for_flavour_lines
+        (match_flavour_lines
             .in_set(GameSet::Jar)
             .in_set(GameSet::GamePlay),)
             .run_if(in_state(GameState::PillLanded))
             .run_if(in_state(AppState::Game)),
-        );
-        if let Ok(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
-            render_app.add_systems(
-                ExtractSchedule,
-                (extract_organ_sprites, extract_wall_sprites).after(SpriteSystem::ExtractSprites)
-                .run_if(|state: Extract<Res<State<AppState>>>|*state.get() == AppState::Game),
+    );
+    if let Ok(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+        render_app.add_systems(
+            ExtractSchedule,
+            (
+                extract_organ_sprites,
+                extract_wall_sprites,
+                extract_pill_queue,
+            )
+                .after(SpriteSystem::ExtractSprites)
+                .run_if(|state: Extract<Res<State<AppState>>>| *state.get() == AppState::Game),
         );
     }
+
+    //app.add_plugin(DebugPlugin);
 
     app.run();
 }
 
-
-
-fn setup(mut commands: Commands) {
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let mut camera_2d_bundle = Camera2dBundle::default();
     camera_2d_bundle.camera_2d.clear_color = ClearColorConfig::Custom(Color::MAROON);
     commands.spawn(camera_2d_bundle);
+
+    commands.insert_resource(PillSpriteHandle(asset_server.load(PILL_SPRITE_PATH)));
+
+    commands.spawn((PillSpriteQueueMarker, VisibilityBundle::default()));
 }
 
 fn setup_game(
@@ -503,14 +567,24 @@ fn setup_game(
     asset_server: Res<AssetServer>,
     _rules: Res<GameRules>,
     mut camera_query: Query<&mut Transform, With<Camera2d>>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut pill_queue: ResMut<PillQueue>,
+    mut danger: ResMut<Danger>,
+    mut vitals: ResMut<Vitals>,
+    level: Res<Level>,
 ) {
-    let organ_inner_area = dim(9, 20).grid();
-    let spawn_area = grid(pos(4, 18), dim(1, 2));
-    let germ_max_y = 15;
+    *danger = Danger::default();
+    *vitals = Vitals::default();
+
+    *pill_queue = pill_queue.new();
+    let organ_inner_area = dim(9, 18).grid();
+    let spawn_area = grid(pos(4, 16), dim(1, 2));
+    let germ_max_y = 14;
     let mut camera_transform = camera_query.single_mut();
-    camera_transform.scale *= Vec2::splat(0.5).extend(1.0);
-    camera_transform.translation +=
-        (0.5 * CELL_SIZE * Vec2::from(organ_inner_area.dim) + 24. * Vec2::Y).extend(0.);
+    camera_transform.scale = Vec2::splat(0.5).extend(1.0);
+    let ct = 75. * Vec2::X + 0.5 * CELL_SIZE * Vec2::from(organ_inner_area.dim) + 24. * Vec2::Y;
+    camera_transform.translation.x = ct.x;
+    camera_transform.translation.y = ct.y;
 
     commands.insert_resource(OrganGeometry {
         translation: Vec3::ZERO,
@@ -525,15 +599,19 @@ fn setup_game(
         &wall_textures,
         &back_textures,
         organ_inner_area,
+        spawn_area.pos.up().up(),
+        10,
         &mut jar,
     );
 
     let spawns = organ_inner_area
         .into_iter()
         .filter(|pos| pos.y <= germ_max_y);
-    spawn_germs(&mut commands, 10, &mut jar, spawns, &asset_server);
+
+    spawn_germs(&mut commands, 9 + 9 * level.0 as usize, &mut jar, spawns, &asset_server);
 
     commands.insert_resource(jar);
+    next_state.set(GameState::PillFalling);
 }
 
 fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
@@ -558,6 +636,7 @@ fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
             },
             ..Default::default()
         })
+        .insert(GameUiElement)
         .with_children(|parent| {
             parent
                 .spawn(NodeBundle {
@@ -570,7 +649,7 @@ fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
                         gap: Size::all(Val::Px(10.)),
                         ..Default::default()
                     },
-                    background_color: Color::GRAY.with_a(0.1).into(),
+                    background_color: Color::NAVY.with_a(0.2).into(),
                     ..Default::default()
                 })
                 .with_children(|parent| {
@@ -594,7 +673,7 @@ fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
                         gap: Size::all(Val::Px(10.)),
                         ..Default::default()
                     },
-                    background_color: Color::GRAY.with_a(0.1).into(),
+                    background_color: Color::NAVY.with_a(0.2).into(),
                     ..Default::default()
                 })
                 .with_children(|parent| {
@@ -609,6 +688,213 @@ fn spawn_score_display(mut commands: Commands, asset_server: Res<AssetServer>) {
         });
 }
 
+#[derive(Resource, Default)]
+struct Vitals([f32; 3]);
+
+impl Vitals {
+    fn clamp(&mut self) {
+        for i in 0..3 {
+            self.0[i] = self.0[i].clamp(0., 1.1);
+        }
+    }
+    fn inc(&mut self, flavour: Flavour) {
+        for f in Flavour::ALL {
+            self.0[f as usize] += if f == flavour { 0.06 } else { -0.01 };
+            self.clamp();
+        }
+    }
+
+    fn dec(&mut self, flavour: Flavour) {
+        for f in Flavour::ALL {
+            self.0[f as usize] += if f == flavour { -0.4 } else { 0.01 };
+        }
+        self.clamp();
+    }
+
+    fn get(&self, flavour: Flavour) -> f32 {
+        self.0[flavour as usize]
+    }
+
+    fn is_dead(&self) -> Option<String> {
+        for flavour in Flavour::ALL {
+            if 1. <= self.get(flavour) {
+                let cause = match flavour {
+                    Flavour::Red => "catastrophic gastric implosion",
+                    Flavour::Blue => "encephalon emancipation syndrome",
+                    Flavour::Yellow => "total bone disintegration",
+                };
+                return Some(cause.into());
+            }
+        }
+        None
+    }
+}
+
+#[derive(Resource)]
+struct Level(u64);
+
+impl Default for Level {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+#[derive(Component)]
+struct LevelLabel;
+
+fn spawn_level_display(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    level: Res<Level>,
+) {
+    let text_style = TextStyle {
+        font_size: 14.,
+        font: asset_server.load(FONT_PATH),
+        color: Color::WHITE,
+    };
+
+    let num_style = TextStyle {
+        font_size: 14.,
+        font: asset_server.load(FONT_BOLD_PATH),
+        color: Color::YELLOW,
+    };
+
+    commands.spawn(NodeBundle {
+        style: Style {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(10.),
+            size: Size::width(Val::Percent(100.)),
+            justify_content: JustifyContent::Center,
+            padding: UiRect::vertical(Val::Px(2.)),
+            ..Default::default()
+            
+        },
+        background_color: Color::BLACK.with_a(0.85).into(),
+        ..Default::default()
+    }).insert(GameUiElement)
+    .with_children(|parent| {
+        parent.spawn(TextBundle::from_section("Level ", text_style));
+        parent.spawn(TextBundle::from_section(level.0.to_string(), num_style)).insert(LevelLabel);
+    });
+}
+
+fn update_level_display( 
+    level: Res<Level>,
+    mut text_query: Query<&mut Text, With<LevelLabel>>,
+) {
+    if level.is_changed() {
+        for mut text in text_query.iter_mut() {
+            text.sections[0].value = level.0.to_string();
+        }
+    
+    }
+}
+
+
+#[derive(Component)]
+struct VitalDisplay(usize);
+
+fn spawn_vitals_display(mut commands: Commands, asset_server: Res<AssetServer>) {
+    let vitals = Vitals::default();
+    let root = commands
+        .spawn(NodeBundle {
+            style: Style {
+                size: Size::new(Val::Percent(100.0), Val::Percent(100.0)),
+                position_type: PositionType::Absolute,
+                justify_content: JustifyContent::End,
+                align_items: AlignItems::Center,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .insert(GameUiElement)
+        .id();
+    let panel = commands
+        .spawn(NodeBundle {
+            style: Style {
+                flex_direction: FlexDirection::Column,
+                size: Size::width(Val::Px(300.)),
+                margin: UiRect::all(Val::Px(10.)),
+                gap: Size::all(Val::Px(10.)),
+                align_items: AlignItems::Stretch,
+                justify_content: JustifyContent::Center,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .id();
+    commands.entity(root).add_child(panel);
+
+    let labels = [
+        "metabolic elasticity",
+        "cranial viscosity",
+        "skeletal resonance",
+    ];
+
+    let text_style = TextStyle {
+        font_size: 20.,
+        font: asset_server.load(FONT_PATH),
+        color: Color::WHITE,
+    };
+
+    for i in 0..3 {
+        let label = labels[i];
+        let flavour = Flavour::ALL[i];
+        let inner = commands
+            .spawn(NodeBundle {
+                style: Style {
+                    flex_direction: FlexDirection::Column,
+                    gap: Size::all(Val::Px(5.)),
+                    align_items: AlignItems::Stretch,
+                    padding: UiRect::all(Val::Px(5.)),
+                    ..Default::default()
+                },
+                background_color: Color::NAVY.with_a(0.2).into(),
+                ..Default::default()
+            })
+            .with_children(|parent| {
+                parent.spawn(TextBundle::from_section(label, text_style.clone()));
+
+                parent
+                    .spawn(NodeBundle {
+                        style: Style {
+                            flex_direction: FlexDirection::RowReverse,
+                            size: Size::height(Val::Px(20.)),
+                            ..default()
+                        },
+                        background_color: flavour.color().into(),
+                        ..Default::default()
+                    })
+                    .with_children(|parent| {
+                        parent.spawn((
+                            NodeBundle {
+                                style: Style {
+                                    size: Size::width(Val::Percent(100.)),
+                                    ..default()
+                                },
+                                background_color: Color::BLACK.with_a(0.8).into(),
+                                ..default()
+                            },
+                            flavour,
+                        ));
+                    });
+            })
+            .id();
+        commands.entity(panel).add_child(inner);
+    }
+
+    commands.insert_resource(vitals);
+}
+
+fn update_vitals_display(vitals: Res<Vitals>, mut bar_query: Query<(&mut Style, &Flavour)>) {
+    if vitals.is_changed() {
+        for (mut style, flavour) in bar_query.iter_mut() {
+            let value = vitals.get(*flavour);
+            style.size.width = Val::Percent((1. - value) * 100.);
+        }
+    }
+}
+
 fn gray(value: f32) -> Color {
     Color::rgb(value, value, value)
 }
@@ -618,13 +904,43 @@ fn spawn_organ_walls(
     wall_textures: &[Handle<Image>],
     back_textures: &[Handle<Image>],
     organ_inner_area: Grid,
+    pipe_point: Pos,
+    pipe_pipe_len: i16,
     organ: &mut Organ,
 ) {
     let rng = &mut thread_rng();
     let inner = organ_inner_area;
     let outer = inner.expand(Dim::ONE);
+    let mut pipe = HashSet::default();
 
-    for pos in outer {
+    for y in pipe_point.y..pipe_point.y + pipe_pipe_len {
+        let pos = pos(pipe_point.x, y);
+        pipe.insert(pos);
+        commands.spawn((
+            back_textures.choose(rng).unwrap().clone(),
+            pos,
+            Depth::PillPipe,
+            Tint(gray(0.4)),
+            Dir::random(rng),
+            Flip::random(rng),
+            Visibility::Visible,
+            ComputedVisibility::default(),
+        ));
+        commands.spawn((
+            WallBundle::random(rng, wall_textures, pos.left(), Depth::PipeWall)
+                .tint(Color::rgb(0.8, 0.8, 1.0))
+                .add_shadow(),
+            WallEffect(-4. * Vec2::X),
+        ));
+        commands.spawn((
+            WallBundle::random(rng, wall_textures, pos.right(), Depth::PipeWall)
+                .tint(Color::rgb(0.8, 0.8, 1.0))
+                .add_shadow(),
+            WallEffect(4. * Vec2::X),
+        ));
+    }
+
+    for pos in outer.into_iter().filter(|pos| !pipe.contains(pos)) {
         if inner.contains(pos) {
             commands.spawn((
                 back_textures.choose(rng).unwrap().clone(),
@@ -636,7 +952,7 @@ fn spawn_organ_walls(
                 Visibility::Visible,
                 ComputedVisibility::default(),
             ));
-        } else if pos.y < inner.max_y() {
+        } else {
             let wx = if pos.x == outer.pos.x {
                 -1.
             } else if pos.x == inner.max_x() {
@@ -644,7 +960,14 @@ fn spawn_organ_walls(
             } else {
                 0.
             };
-            let wy = if pos.y == outer.pos.y { -1. } else { 0. };
+            let wy = if pos.y == outer.pos.y {
+                -1.
+            } else if pos.y == inner.max_y() {
+                1.
+            } else {
+                0.
+            };
+
             let w = 8. * vec2(wx, wy);
 
             let id = commands
@@ -654,10 +977,7 @@ fn spawn_organ_walls(
                 ))
                 .id();
             organ.insert(pos, id);
-        } else {
-            let id = commands.spawn((pos, Wall)).id();
-            organ.insert(pos, id);
-        };
+        }
     }
 }
 
@@ -720,16 +1040,17 @@ struct PillPart;
 struct Joined(Entity);
 
 fn spawn_new_pill(
-    jar: OrganMap,
+    organ: OrganMap,
     active_pill_query: Query<Entity, With<ActivePill>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     rules: Res<GameRules>,
-) {
-    let rng = &mut thread_rng();
-    let position = jar.map.spawn_area.pos;
-    let pill_bottom = *Flavour::ALL.choose(rng).unwrap();
-    let pill_top = *Flavour::ALL.choose(rng).unwrap();
+    mut pill_queue: ResMut<PillQueue>,
+) { 
+    let flavours = pill_queue.pop_next_pill();
+    let position = organ.map.spawn_area.pos;
+    let pill_bottom = flavours[0];
+    let pill_top = flavours[1];
     let pill_texture = asset_server.load(PILL_SPRITE_PATH);
     if active_pill_query.is_empty() {
         let a = commands.spawn_empty().id();
@@ -840,6 +1161,11 @@ impl WallBundle {
             computed_visibility: ComputedVisibility::default(),
             wall: Wall,
         }
+    }
+
+    fn tint(mut self, color: Color) -> Self {
+        self.tint = Tint(color);
+        self
     }
 }
 
@@ -1052,7 +1378,6 @@ fn drop_pill(
     mut pivot_query: Query<(Entity, &mut Pos, &mut DropTimer), (With<ActivePill>, With<PivotPill>)>,
     mut end_query: Query<(Entity, &mut Pos), (With<ActivePill>, Without<PivotPill>)>,
     rules: Res<GameRules>,
-    //mut jar: ResMut<Organ>,
     mut organ: OrganMap,
     mut commands: Commands,
     mut next_game_state: ResMut<NextState<GameState>>,
@@ -1126,7 +1451,7 @@ fn find_flavour_lines(
     out
 }
 
-fn search_jar_for_flavour_lines(
+fn match_flavour_lines(
     asset_server: Res<AssetServer>,
     mut commands: Commands,
     mut organ: OrganMap,
@@ -1135,6 +1460,8 @@ fn search_jar_for_flavour_lines(
     mut joined_query: Query<&Joined>,
     mut image_query: Query<&mut Handle<Image>>,
     mut killed_event: EventWriter<KilledSomethingEvent>,
+    vitals: Res<Vitals>,
+    mut cause_of_death: ResMut<CauseOfDeath>,
 ) {
     let matches = find_flavour_lines(|pos| organ.flavour(pos), organ.map.bounds(), rules.matches);
     let mut removed = HashSet::default();
@@ -1157,14 +1484,25 @@ fn search_jar_for_flavour_lines(
             next: GameState::Collapsing,
         });
         next_state.set(GameState::Wait);
-    } else {
-        commands.insert_resource(NextStateTimer {
-            remaining: 0.4,
-            next: GameState::PillFalling,
-        });
-        next_state.set(GameState::Wait);
+    } else {        
+        if !organ.map.spawn_area.into_iter().all(|pos| organ.is_empty(pos)) {
+            cause_of_death.0 = "too many pills".into();
+            next_state.set(GameState::GameOver);
+        } else if let Some(s) = vitals.is_dead() {
+            cause_of_death.0 = s;
+            next_state.set(GameState::GameOver);
+        } else {
+            commands.insert_resource(NextStateTimer {
+                remaining: 0.4,
+                next: GameState::PillFalling,
+            });
+            next_state.set(GameState::Wait);
+        }
     }
 }
+
+#[derive(Resource, Default)] 
+struct CauseOfDeath(String);
 
 struct KilledSomethingEvent(Entity);
 
@@ -1200,6 +1538,34 @@ fn update_kill_count_and_score(
                 points += 10 * i;
             }
             score_points.send(ScorePointsEvent(points));
+        }
+    }
+}
+
+fn update_vitals_on_kill_pill(
+    mut vitals: ResMut<Vitals>,
+    flavour_query: Query<&Flavour, Without<Germ>>,
+    mut kill_events: EventReader<KilledSomethingEvent>,
+) {
+    for &KilledSomethingEvent(id) in kill_events.iter() {
+        if let Ok(flavour) = flavour_query.get(id) {
+            if flavour_query.contains(id) {
+                vitals.inc(*flavour);
+            }
+        }
+    }
+}
+
+fn update_vitals_on_kill_germ(
+    mut vitals: ResMut<Vitals>,
+    flavour_query: Query<&Flavour, With<Germ>>,
+    mut kill_events: EventReader<KilledSomethingEvent>,
+) {
+    for &KilledSomethingEvent(id) in kill_events.iter() {
+        if let Ok(flavour) = flavour_query.get(id) {
+            if flavour_query.contains(id) {
+                vitals.dec(*flavour);
+            }
         }
     }
 }
@@ -1284,17 +1650,21 @@ impl OrganGeometry {
 enum Depth {
     Shadow,
     OrganBack,
+    PipeWall,
     OrganWall,
     Bug,
     Pill,
     Top,
+    PillPipe,
 }
 
 impl Depth {
     fn z(self) -> f32 {
         match self {
             Depth::OrganBack => 0.,
-            Depth::Shadow => 1.,
+            Depth::PillPipe => 1.,
+            Depth::Shadow => 2.,
+            Depth::PipeWall => 90.,
             Depth::OrganWall => 100.,
             Depth::Bug => 10.,
             Depth::Pill => 20.,
@@ -1413,7 +1783,41 @@ fn extract_organ_sprites(
     }
 }
 
-fn extract_wall_sprites(    
+#[derive(Resource)]
+#[derive(Debug)]
+struct Danger {
+    rate: f32,
+    pow: f32,
+    rate_target: f32,
+    pow_target: f32,
+}
+
+fn update_danger(time: Res<Time>, vitals: Res<Vitals>, mut danger: ResMut<Danger>) {
+    let a = vitals.0[0];
+    let b = vitals.0[1];
+    let c = vitals.0[2];
+    danger.rate_target = 1. + 7. * a + 3. * c;
+    danger.pow_target = 1. + 2.5 * b + 1.5 * c;
+
+    let dr = danger.rate_target - danger.rate;
+    let dp = danger.pow_target - danger.pow;
+    danger.rate += dr * time.delta_seconds();
+    danger.pow += dp * time.delta_seconds();
+
+}
+
+impl Default for Danger {
+    fn default() -> Self {
+        Self {
+            rate: 1.,
+            pow: 1.,
+            rate_target: 1.,
+            pow_target: 1.,
+        }
+    }
+}
+
+fn extract_wall_sprites(
     mut extracted_sprites: ResMut<ExtractedSprites>,
     organ_geometry: Extract<Res<OrganGeometry>>,
     shadow_offset: Extract<Res<ShadowOffset>>,
@@ -1431,10 +1835,11 @@ fn extract_wall_sprites(
         )>,
     >,
     time: Extract<Res<Time>>,
+    danger: Extract<Res<Danger>>,
 ) {
-    let p = 1.25;
-    let a = 1.;
-    let s = a * (1.0 + (time.elapsed_seconds() / p).cos()) / 2.;
+    let r = danger.rate;
+    let a = 1. * danger.pow;
+    let s = a * (1.0 + (r * time.elapsed_seconds()).cos()) / 2.;
 
     for (entity, vis, pos, image, &Tint(color), depth, flip, shadow, wall_effect) in
         sprite_query.iter()
@@ -1480,6 +1885,65 @@ fn extract_wall_sprites(
             image_handle_id: image.id(),
             anchor: Vec2::ZERO,
         });
+    }
+}
+
+#[derive(Resource)]
+struct PillSpriteHandle(Handle<Image>);
+
+fn extract_pill_queue(
+    mut extracted_sprites: ResMut<ExtractedSprites>,
+    organ_geometry: Extract<Res<OrganGeometry>>,
+    shadow_offset: Extract<Res<ShadowOffset>>,
+    pill_queue: Extract<Res<PillQueue>>,
+    pill_handle: Extract<Res<PillSpriteHandle>>,
+    organ: Extract<Res<Organ>>,
+    query: Extract<Query<Entity, With<PillSpriteQueueMarker>>>,
+) {
+    let mut cursor = organ.spawn_area.pos.up();
+    let entity = query.single();
+
+    for &pill in pill_queue.pills.iter() {
+        for (i, flavour) in pill.into_iter().enumerate() {
+            cursor = cursor.up();
+            let translation = organ_geometry.map_pos(cursor);
+            let orientation = if i == 0 { Dir::Down } else { Dir::Up };
+            let m = Mat3A::from_rotation_z(orientation.angle());
+            extracted_sprites.sprites.push(ExtractedSprite {
+                entity,
+                color: Color::BLACK.with_a(SHADOW_ALPHA),
+                transform: Affine3A {
+                    matrix3: m,
+                    translation: (translation + shadow_offset.0 + Depth::Shadow.z() * Vec3::Z)
+                        .into(),
+                    ..Default::default()
+                }
+                .into(),
+                rect: None,
+                custom_size: Some(organ_geometry.cell_size),
+                flip_x: false,
+                flip_y: false,
+                image_handle_id: pill_handle.0.id(),
+                anchor: Vec2::ZERO,
+            });
+
+            extracted_sprites.sprites.push(ExtractedSprite {
+                entity,
+                color: flavour.color(),
+                transform: Affine3A {
+                    matrix3: m,
+                    translation: (translation + Depth::Pill.z() * Vec3::Z).into(),
+                    ..Default::default()
+                }
+                .into(),
+                rect: None,
+                custom_size: Some(organ_geometry.cell_size),
+                flip_x: false,
+                flip_y: false,
+                image_handle_id: pill_handle.0.id(),
+                anchor: Vec2::ZERO,
+            });
+        }
     }
 }
 
@@ -1834,25 +2298,143 @@ fn spawn_bordered_sprite_rect(
         .id()
 }
 
-fn spawn_pipe_wall(
-    commands: &mut Commands,
-    position: Vec3,
-    side_color: Color,
-    geometry: OrganGeometry,
-    size: Vec2,
+#[derive(Resource, Default)]
+struct PillQueue {
+    pills: VecDeque<[Flavour; 2]>,
+}
+
+impl PillQueue {
+    fn new(&mut self) -> Self {
+        let rng = &mut thread_rng();
+        let mut pills = VecDeque::new();
+        for i in 0..10 {
+            pills.push_back([
+                Flavour::ALL.choose(rng).copied().unwrap(),
+                Flavour::ALL.choose(rng).copied().unwrap(),
+            ]);
+        }
+        Self { pills }
+    }
+
+    fn pop_next_pill(&mut self) -> [Flavour; 2] {
+        let rng = &mut thread_rng();
+        self.pills.push_back([
+            Flavour::ALL.choose(rng).copied().unwrap(),
+            Flavour::ALL.choose(rng).copied().unwrap(),
+        ]);
+        self.pills.pop_front().unwrap()
+    }
+}
+
+fn despawn_game_elements(
+    mut commands: Commands,
+    query: Query<Entity, Or<(With<GameUiElement>, With<Pos>, With<Sprite>)>>,
 ) {
-    // spawn pipe back
-    commands.spawn(SpriteBundle {
-        sprite: Sprite {
-            color: todo!(),
-            custom_size: todo!(),
+    for entity in query.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+}
+
+fn spawn_game_over_message(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    cause: Res<CauseOfDeath>,
+) {
+    let text_style = TextStyle {
+        font_size: 50.,
+        font: asset_server.load(FONT_BOLD_PATH),
+        color: Color::RED,
+    };
+
+    let c_text_style = TextStyle {
+        font_size: 40.,
+        font: asset_server.load(FONT_PATH),
+        color: Color::FUCHSIA,
+    };
+
+    commands.spawn((
+        NodeBundle {
+        style: Style {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.),
+            top: Val::Px(0.),
+            size: Size::all(Val::Percent(100.)),
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            flex_direction: FlexDirection::Column,
             ..Default::default()
         },
-        transform: todo!(),
+        background_color: Color::BLACK.with_a(0.5).into(),
         ..Default::default()
-    });
+        },
+        GameUiElement,
+    )).with_children(|parent| {
+        parent.spawn(TextBundle::from_section( 
+             "PATIENT DECEASED",
+             text_style.clone(),
+        ).with_background_color(Color::BLACK.with_a(0.5)));
+        parent.spawn(NodeBundle {
+            style: Style {
+                margin: UiRect {
+                    top: Val::Px(10.),
+                    bottom: Val::Px(35.),
+                    ..default()
+                },
+                padding: UiRect::all(Val::Px(5.)),
+                ..Default::default()
+            },
+            background_color: Color::BLACK.with_a(0.95).into(),
+            ..Default::default()
+        }).with_children(|parent| {
+            parent.spawn(TextBundle::from_section(
+                    cause.0.clone(),
+                    c_text_style,
+            ));
+        });
 
-    // spawn left
+        parent.spawn(TextBundle::from_section(
+                 "\n\nGAME OVER", 
+                 text_style
+        ).with_background_color(Color::BLACK.with_a(0.5)));
+    });   
+}
 
-    // spawn right
+
+fn wait_game_over(
+    time: Res<Time>,
+    mut delay: Local<Option<f32>>,
+    mut c: Local<f32>,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut game_state: ResMut<NextState<GameState>>,
+    input: PlayerInput,
+    mut organ_map: ResMut<Organ>,
+    mut commands: Commands,
+    query: Query<(Entity, &Pos, &Flavour),  Or<(With<PillPart>, With<Germ>)>>,
+    mut event_writer: EventWriter<SpawnExplosionEvent>,
+) {
+    
+    if delay.is_none() {
+        *delay = Some(5.);
+        *c = 0.1;
+    }
+
+    *c -= time.delta_seconds();
+    if *c < 0. {
+        let rng = &mut thread_rng();
+        *c = rng.gen_range(0.05 .. 0.2);
+        if let Some((e, p, f)) = query.iter().next() {
+            commands.entity(e).despawn();
+            organ_map.remove_entity(e);
+            event_writer.send(SpawnExplosionEvent { pos: *p, color: f.color() });
+        }
+    }
+
+    if let Some(ref mut t) = *delay {
+        *t -= time.delta_seconds();
+        if *t < 0. || input.just_pressed(PlayerCommand::Select) {
+            *delay = None;
+            next_state.set(AppState::TitleScreen);
+            game_state.set(GameState::Inactive);
+        }
+    }
 }
